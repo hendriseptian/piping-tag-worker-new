@@ -5,11 +5,10 @@ import re
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from workers import asgi
 
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.7-flash"
 
@@ -28,16 +27,78 @@ app = FastAPI(
 )
 
 # GitHub Pages frontend -> Cloudflare Worker API.
-# The origin is restricted to the actual GitHub Pages site.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://hendriseptian.github.io",
-    ],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
-)
+#
+# NOTE: FastAPI's CORSMiddleware is intentionally not used here.
+# Cloudflare Python Workers uses an ASGI adapter, so we apply CORS at
+# the ASGI boundary to guarantee that both preflight OPTIONS responses
+# and normal API responses carry the required headers.
+CORS_ORIGIN = "https://hendriseptian.github.io"
+
+
+class ForceCORSMiddleware:
+    """Small ASGI CORS layer compatible with Cloudflare Python Workers."""
+
+    def __init__(self, application):
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.application(scope, receive, send)
+            return
+
+        origin = ""
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"origin":
+                origin = value.decode("latin-1")
+                break
+
+        # Only enable CORS for the known GitHub Pages frontend.
+        if origin != CORS_ORIGIN:
+            await self.application(scope, receive, send)
+            return
+
+        method = scope.get("method", "GET").upper()
+
+        # Browser preflight for POST /api/extract.
+        if method == "OPTIONS":
+            headers = [
+                (b"access-control-allow-origin", CORS_ORIGIN.encode()),
+                (b"access-control-allow-methods", b"GET, POST, OPTIONS"),
+                (b"access-control-allow-headers", b"Content-Type"),
+                (b"access-control-max-age", b"86400"),
+                (b"vary", b"Origin"),
+            ]
+            await send({
+                "type": "http.response.start",
+                "status": 204,
+                "headers": headers,
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b"",
+            })
+            return
+
+        async def send_with_cors(message):
+            if message.get("type") == "http.response.start":
+                existing = {
+                    key.lower() for key, _ in message.get("headers", [])
+                }
+                headers = list(message.get("headers", []))
+
+                if b"access-control-allow-origin" not in existing:
+                    headers.append(
+                        (b"access-control-allow-origin", CORS_ORIGIN.encode())
+                    )
+                if b"vary" not in existing:
+                    headers.append((b"vary", b"Origin"))
+
+                message = dict(message)
+                message["headers"] = headers
+
+            await send(message)
+
+        await self.application(scope, receive, send_with_cors)
 
 
 # ============================================================
@@ -959,5 +1020,7 @@ async def extract(request: Request):
         },
     }
 
+
+app = ForceCORSMiddleware(app)
 
 Default = asgi.entrypoint(app)
