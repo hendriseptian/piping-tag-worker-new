@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from workers import asgi
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.7-flash"
 
@@ -604,7 +604,8 @@ async def health(request: Request):
     }
 
 
-@app.post("/api/test-gemini", methods=["GET", "POST"])
+@app.get("/api/test-gemini")
+@app.post("/api/test-gemini")
 async def test_gemini(request: Request):
     model = env_value(
         request,
