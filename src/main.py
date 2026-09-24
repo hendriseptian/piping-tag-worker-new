@@ -8,18 +8,56 @@ from fastapi import FastAPI, HTTPException, Request
 from workers import asgi
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DEFAULT_MODEL = "gemini-3.8-flash"
-DEFAULT_FALLBACK = "gemini-3.7-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-3.7-flash"
+
 MAX_TILES_DEFAULT = 8
-MAX_IMAGE_B64 = 5_500_000
-MAX_TOTAL_IMAGE_B64 = 18_000_000
+MAX_IMAGE_B64_DEFAULT = 5_500_000
+MAX_TOTAL_IMAGE_B64_DEFAULT = 18_000_000
+
+INTERACTIONS_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/interactions"
+)
+
 
 app = FastAPI(
     title="Piping Tag Extractor Worker",
     version=APP_VERSION,
 )
 
+
+# ============================================================
+# JSON SCHEMAS
+# ============================================================
+
+TEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string"},
+        "message": {"type": "string"},
+    },
+    "required": ["status", "message"],
+}
+
+OVERVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pid_no": {
+            "type": "string",
+            "description": "P&ID or drawing number only.",
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low", "none"],
+        },
+        "evidence": {
+            "type": "string",
+            "description": "Short visible transcription supporting the P&ID number.",
+        },
+    },
+    "required": ["pid_no", "confidence", "evidence"],
+}
 
 TAG_SCHEMA = {
     "type": "object",
@@ -29,12 +67,29 @@ TAG_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "tag_no": {"type": "string"},
-                    "size_nps_in": {"type": "string"},
-                    "evidence": {"type": "string"},
-                    "confidence": {"type": "string"},
+                    "tag_no": {
+                        "type": "string",
+                        "description": "Exact visible piping line tag.",
+                    },
+                    "size_nps_in": {
+                        "type": "string",
+                        "description": "NPS in inches, derived from the line tag only.",
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "Short exact transcription of the visible tag.",
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
                 },
-                "required": ["tag_no", "size_nps_in", "evidence", "confidence"],
+                "required": [
+                    "tag_no",
+                    "size_nps_in",
+                    "evidence",
+                    "confidence",
+                ],
             },
         }
     },
@@ -42,146 +97,209 @@ TAG_SCHEMA = {
 }
 
 
-OVERVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "pid_no": {"type": "string"},
-        "confidence": {"type": "string"},
-        "evidence": {"type": "string"},
-    },
-    "required": ["pid_no", "confidence", "evidence"],
-}
+# ============================================================
+# PROMPTS
+# ============================================================
 
+TEST_PROMPT = """
+Return exactly:
+status = ok
+message = Gemini connection successful
 
-EXTRACT_PROMPT = r"""
-You are a specialist P&ID document extraction system.
+Do not add anything else.
+"""
+
+OVERVIEW_PROMPT = r"""
+You are reading one P&ID drawing image.
 
 TASK:
-Extract ONLY piping LINE TAGS visible in this image.
+Identify ONLY the P&ID / drawing number shown in the title block.
 
-A piping tag is the alphanumeric line designation printed on a P&ID near a pipe.
-Do NOT extract:
+Look for a field explicitly associated with:
+- P&ID No.
+- P&ID Number
+- Drawing No.
+- Drawing Number
+
+IMPORTANT:
+- Do not return project numbers.
+- Do not return document numbers.
+- Do not return revision numbers.
+- Do not return sheet/page numbers.
+- Do not infer a number that is not readable.
+- If the correct field cannot be read confidently, return an empty pid_no.
+- Evidence must be a short transcription of the visible text.
+"""
+
+TAG_PROMPT = r"""
+You are a specialist P&ID line-tag extraction system.
+
+TASK:
+Extract ONLY piping LINE TAGS visible in the supplied P&ID image tile.
+
+A piping line tag is the designation printed for a process/utility piping line.
+
+DO NOT extract:
 - equipment tags
 - valve tags
 - instrument tags
 - nozzle numbers
-- drawing dimensions
-- elevation numbers
+- dimensions
+- elevations
 - grid references
-- page numbers
 - revision numbers
-- material specifications
+- dates
+- page numbers
+- drawing numbers
 - pressure/temperature values
-- text from the title block unless it is clearly a piping line tag
+- material specifications
+- random numeric labels
 
-IMPORTANT:
-1. Read the tag exactly as printed.
-2. Do not invent missing characters.
-3. Do not normalize a tag into a format that is not visibly supported.
-4. Ignore partial/cut-off tags.
-5. If a candidate is ambiguous, DO NOT include it.
-6. A tag may contain a size such as 1", 2", 3", 4", etc.
-7. Extract the NPS size ONLY when it is explicitly part of the tag or unambiguously printed as the tag's line-size field.
-8. The output must contain only tags that are actually visible.
-9. Keep duplicate visible occurrences in the raw response; the server will deduplicate later.
-10. Evidence must be a short exact visual transcription showing why the tag was accepted.
+ACCURACY RULES:
+
+1. Transcribe the tag EXACTLY as visible.
+2. Never invent, repair, autocorrect, or normalize characters.
+3. Do not combine text from two different nearby labels.
+4. Do not use a nearby valve/nozzle size as the line size.
+5. Ignore a tag if it is cut off or genuinely ambiguous.
+6. Prefer omission over guessing.
+7. The evidence must be a short transcription of the visible line tag.
+8. Confidence must be high, medium, or low.
+9. Return only actual piping line tags.
+
+NPS RULES:
+
+- Extract NPS from the size explicitly belonging to the line tag.
+- Example:
+  1HC106-1"-FC2L
+  => tag_no = 1HC106-1"-FC2L
+  => size_nps_in = 1
+
+- Example:
+  1HC1-2"-FG2D
+  => tag_no = 1HC1-2"-FG2D
+  => size_nps_in = 2
+
+- If the NPS is not explicitly readable in the tag, return an empty size_nps_in.
+- Never guess the NPS from nearby graphics.
+
+TILE BOUNDARY RULE:
+If a tag is cut by the edge of the supplied tile, ignore it. It will be recovered from an overlapping neighboring tile.
 
 Return JSON matching the supplied schema.
 """
 
-OVERVIEW_PROMPT = r"""
-You are reading a P&ID drawing overview.
 
-TASK:
-Identify the P&ID / drawing number shown in the title block.
-
-Rules:
-- Read only the drawing/P&ID number.
-- Do not return project number, client number, sheet number, revision, date, or document number unless it is clearly the field labeled P&ID No. / Drawing No.
-- If the field cannot be read confidently, return an empty string.
-- Do not guess.
-- Evidence must be the exact visible text used to make the decision.
-
-Return JSON matching the supplied schema.
-"""
-
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
 def env_value(request: Request, name: str, default: str) -> str:
     env = request.scope.get("env")
-    if env is not None:
-        try:
-            value = getattr(env, name)
-            if value:
-                return str(value)
-        except Exception:
-            pass
+    if env is None:
+        return default
+
+    try:
+        value = getattr(env, name)
+        if value is not None and str(value).strip():
+            return str(value)
+    except Exception:
+        pass
+
     return default
 
 
-def normalize_b64(value: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError("image data must be a string")
-    value = value.strip()
-    if value.startswith("data:"):
-        comma = value.find(",")
-        if comma < 0:
-            raise ValueError("invalid data URL")
-        value = value[comma + 1:]
-    return value
-
-
-def image_part(image_b64: str, mime_type: str) -> dict[str, Any]:
-    data = normalize_b64(image_b64)
-    if len(data) > MAX_IMAGE_B64:
-        raise ValueError("image tile is too large")
-    return {
-        "inline_data": {
-            "mime_type": mime_type or "image/jpeg",
-            "data": data,
-        }
-    }
-
-
-def extract_json_from_response(payload: dict[str, Any]) -> Any:
-    # generateContent response
-    candidates = payload.get("candidates") or []
-    if candidates:
-        parts = ((candidates[0].get("content") or {}).get("parts") or [])
-        text_parts = [p.get("text") for p in parts if isinstance(p, dict) and p.get("text")]
-        if text_parts:
-            return parse_json_text("\n".join(text_parts))
-
-    # Interactions-style response, for future compatibility
-    output = payload.get("output") or payload.get("steps") or []
-    if isinstance(output, list):
-        texts: list[str] = []
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content") or []
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("text"):
-                        texts.append(str(block["text"]))
-        if texts:
-            return parse_json_text("\n".join(texts))
-
-    raise ValueError("Gemini returned no text output")
-
-
-def parse_json_text(text: str) -> Any:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
+def env_int(request: Request, name: str, default: int) -> int:
+    raw = env_value(request, name, str(default))
     try:
-        return json.loads(cleaned)
+        return int(raw)
+    except Exception:
+        return default
+
+
+# ============================================================
+# CLOUDFLARE FETCH
+# ============================================================
+
+async def cf_fetch(url: str, options: dict[str, Any]):
+    from js import Object, fetch
+    from pyodide.ffi import to_js
+
+    js_options = to_js(
+        options,
+        dict_converter=Object.fromEntries,
+    )
+
+    return await fetch(url, js_options)
+
+
+# ============================================================
+# GEMINI INTERACTIONS API
+# ============================================================
+
+def get_api_key(request: Request) -> str:
+    env = request.scope.get("env")
+
+    if env is None:
+        return ""
+
+    try:
+        value = getattr(env, "GEMINI_API_KEY")
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
+def parse_interaction_output(payload: dict[str, Any]) -> str:
+    # Current Interactions API returns model output in steps.
+    for step in payload.get("steps", []) or []:
+        if not isinstance(step, dict):
+            continue
+
+        if step.get("type") != "model_output":
+            continue
+
+        for content in step.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+
+            if content.get("type") == "text" and content.get("text"):
+                return str(content["text"])
+
+    # Be tolerant if a future response exposes output_text directly.
+    direct = payload.get("output_text")
+    if direct:
+        return str(direct)
+
+    raise ValueError("Gemini returned no text output.")
+
+
+def parse_json_output(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        value = json.loads(cleaned)
+        if not isinstance(value, dict):
+            raise ValueError("Gemini JSON output is not an object.")
+        return value
     except json.JSONDecodeError:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(cleaned[start:end + 1])
-        raise
+            value = json.loads(cleaned[start:end + 1])
+            if not isinstance(value, dict):
+                raise ValueError("Gemini JSON output is not an object.")
+            return value
+        raise ValueError("Gemini returned invalid JSON.")
 
 
 async def call_gemini(
@@ -190,47 +308,51 @@ async def call_gemini(
     model: str,
     prompt: str,
     schema: dict[str, Any],
-    image_b64: str | None = None,
-    mime_type: str = "image/jpeg",
-) -> Any:
-    env = request.scope.get("env")
-    if env is None:
-        raise RuntimeError("Cloudflare env is unavailable")
+    images: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
 
-    try:
-        api_key = str(getattr(env, "GEMINI_API_KEY"))
-    except Exception:
-        api_key = ""
+    api_key = get_api_key(request)
 
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY secret is not configured")
+        raise RuntimeError(
+            "GEMINI_API_KEY secret is not configured."
+        )
 
-    parts: list[dict[str, Any]] = []
-    if image_b64:
-        parts.append(image_part(image_b64, mime_type))
-    parts.append({"text": prompt})
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": prompt,
+        }
+    ]
+
+    for image in images or []:
+        content.append(
+            {
+                "type": "image",
+                "data": image["data"],
+                "mime_type": image["mime_type"],
+            }
+        )
 
     body = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": schema,
+        "model": model,
+        "store": False,
+        "input": content,
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": schema,
         },
     }
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        + model
-        + ":generateContent"
-    )
-
-    response = await request_js_fetch(
-        url,
+    response = await cf_fetch(
+        INTERACTIONS_URL,
         {
             "method": "POST",
             "headers": {
                 "x-goog-api-key": api_key,
                 "Content-Type": "application/json",
+                "Api-Revision": "2026-05-20",
             },
             "body": json.dumps(body),
         },
@@ -240,79 +362,207 @@ async def call_gemini(
     raw = await response.text()
 
     if status < 200 or status >= 300:
-        raise RuntimeError(f"Gemini HTTP {status}: {raw[:1000]}")
+        # Do not return the secret.
+        raise RuntimeError(
+            f"Gemini HTTP {status}: {raw[:1500]}"
+        )
 
     payload = json.loads(raw)
-    return extract_json_from_response(payload)
+    output_text = parse_interaction_output(payload)
+    return parse_json_output(output_text)
 
 
-async def request_js_fetch(url: str, options: dict[str, Any]):
-    # Cloudflare Python Workers exposes the Fetch API through the JS FFI.
-    from js import Object, fetch
-    from pyodide.ffi import to_js
+# ============================================================
+# IMAGE VALIDATION / NORMALIZATION
+# ============================================================
 
-    js_options = to_js(options, dict_converter=Object.fromEntries)
-    return await fetch(url, js_options)
+def normalize_b64(value: str) -> str:
+    value = str(value or "").strip()
 
+    if value.startswith("data:"):
+        comma = value.find(",")
+        if comma < 0:
+            raise ValueError("Invalid image data URL.")
+        value = value[comma + 1:]
+
+    return value
+
+
+def validate_image(
+    request: Request,
+    image: Any,
+    mime_type: Any,
+) -> dict[str, str]:
+
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError("Image data is missing.")
+
+    data = normalize_b64(image)
+
+    max_size = env_int(
+        request,
+        "MAX_IMAGE_B64",
+        MAX_IMAGE_B64_DEFAULT,
+    )
+
+    if len(data) > max_size:
+        raise ValueError(
+            f"Image tile is too large. Limit is {max_size} base64 characters."
+        )
+
+    # Validate that the payload is actually base64.
+    try:
+        base64.b64decode(
+            data,
+            validate=True,
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Image data is not valid base64."
+        ) from exc
+
+    mime = str(
+        mime_type or "image/jpeg"
+    ).strip().lower()
+
+    allowed = {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
+
+    if mime not in allowed:
+        raise ValueError(
+            "Unsupported image MIME type. "
+            "Use image/jpeg, image/png, or image/webp."
+        )
+
+    return {
+        "data": data,
+        "mime_type": mime,
+    }
+
+
+# ============================================================
+# TAG NORMALIZATION
+# ============================================================
 
 def clean_tag(value: Any) -> str:
     if value is None:
         return ""
+
     value = str(value).strip()
+
+    # Preserve the actual characters but remove accidental
+    # whitespace introduced by OCR/vision transcription.
     value = re.sub(r"\s+", "", value)
+
     return value
 
 
 def clean_size(value: Any) -> str:
     if value is None:
         return ""
+
     value = str(value).strip()
-    value = value.replace("″", '"').replace("”", '"').replace("“", '"')
+
+    value = (
+        value
+        .replace("″", '"')
+        .replace("”", '"')
+        .replace("“", '"')
+    )
+
     value = re.sub(r"\s+", "", value)
-    m = re.search(r"(\d+(?:\.\d+)?)", value)
-    return m.group(1) if m else ""
+
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)?)\"?",
+        value,
+    )
+
+    if match:
+        return match.group(1)
+
+    return ""
 
 
-def dedupe_tags(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def size_from_tag(tag: str) -> str:
+    # Primary expected pattern:
+    # 1HC106-1"-FC2L
+    match = re.search(
+        r'-(\d+(?:\.\d+)?)["″”](?:-|$)',
+        tag,
+    )
+
+    if match:
+        return match.group(1)
+
+    # Secondary:
+    # prefix-1"
+    match = re.search(
+        r'(\d+(?:\.\d+)?)["″”](?:-|$)',
+        tag,
+    )
+
+    if match:
+        return match.group(1)
+
+    return ""
+
+
+def dedupe_tags(
+    items: list[dict[str, Any]],
+    pid_no: str,
+) -> list[dict[str, Any]]:
+
     seen: set[str] = set()
     result: list[dict[str, Any]] = []
 
     for item in items:
         tag = clean_tag(item.get("tag_no"))
-        size = clean_size(item.get("size_nps_in"))
+
         if not tag:
             continue
 
         key = tag.upper()
+
         if key in seen:
             continue
 
         seen.add(key)
+
+        size = clean_size(
+            item.get("size_nps_in")
+        )
+
+        if not size:
+            size = size_from_tag(tag)
+
         result.append(
             {
                 "tag_no": tag,
-                "pid_no": "",
+                "pid_no": pid_no,
                 "from": "",
                 "to": "",
                 "size_nps_in": size,
-                "evidence": str(item.get("evidence") or "").strip(),
-                "confidence": str(item.get("confidence") or "").strip().lower(),
+                "evidence": str(
+                    item.get("evidence") or ""
+                ).strip(),
+                "confidence": str(
+                    item.get("confidence") or ""
+                ).strip().lower(),
+                "tile_id": str(
+                    item.get("tile_id") or ""
+                ),
             }
         )
 
     return result
 
 
-def parse_size_from_tag(tag: str) -> str:
-    # Typical line tag example: 1HC106-1"-FC2L
-    m = re.search(r'-(\d+(?:\.\d+)?)["″”]', tag)
-    if m:
-        return m.group(1)
-
-    # Conservative fallback: a size-like number immediately followed by inch mark.
-    m = re.search(r'(?:^|-)(\d+(?:\.\d+)?)["″”](?:-|$)', tag)
-    return m.group(1) if m else ""
-
+# ============================================================
+# ROUTES
+# ============================================================
 
 @app.get("/")
 async def root():
@@ -329,169 +579,368 @@ async def health(request: Request):
         "status": "ok",
         "service": "piping-tag-extractor",
         "version": APP_VERSION,
-        "model": env_value(request, "GEMINI_MODEL", DEFAULT_MODEL),
-        "fallback_model": env_value(request, "GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK),
-        "pipeline": "overview + high-resolution tile vision + strict JSON + deduplication",
-        "output": ["Tag No.", "P&ID No.", "From", "To", "NPS (in)"],
+        "model": env_value(
+            request,
+            "GEMINI_MODEL",
+            DEFAULT_MODEL,
+        ),
+        "fallback_model": env_value(
+            request,
+            "GEMINI_FALLBACK_MODEL",
+            DEFAULT_FALLBACK_MODEL,
+        ),
+        "pipeline": (
+            "Gemini Interactions API + high-resolution "
+            "overlapping tile vision + strict JSON + deduplication"
+        ),
+        "output": [
+            "Tag No.",
+            "P&ID No.",
+            "From",
+            "To",
+            "NPS (in)",
+        ],
         "line_description": "blank",
     }
+
+
+@app.post("/api/test-gemini")
+async def test_gemini(request: Request):
+    model = env_value(
+        request,
+        "GEMINI_MODEL",
+        DEFAULT_MODEL,
+    )
+    fallback = env_value(
+        request,
+        "GEMINI_FALLBACK_MODEL",
+        DEFAULT_FALLBACK_MODEL,
+    )
+
+    try:
+        result = await call_gemini(
+            request,
+            model=model,
+            prompt=TEST_PROMPT,
+            schema=TEST_SCHEMA,
+        )
+
+        return {
+            "status": "ok",
+            "gemini": "connected",
+            "model": model,
+            "fallback_model": fallback,
+            "result": result,
+        }
+
+    except Exception as exc:
+        # One fallback attempt.
+        try:
+            result = await call_gemini(
+                request,
+                model=fallback,
+                prompt=TEST_PROMPT,
+                schema=TEST_SCHEMA,
+            )
+
+            return {
+                "status": "ok",
+                "gemini": "connected",
+                "model": fallback,
+                "fallback_used": True,
+                "result": result,
+            }
+
+        except Exception as fallback_exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "Gemini connection failed.",
+                    "primary_error": str(exc),
+                    "fallback_error": str(fallback_exc),
+                },
+            )
 
 
 @app.post("/api/extract")
 async def extract(request: Request):
     try:
         body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid JSON body.",
+        ) from exc
 
-    overview = body.get("overview")
     tiles = body.get("tiles")
+    overview = body.get("overview")
 
     if not isinstance(tiles, list) or not tiles:
-        raise HTTPException(status_code=400, detail="tiles must be a non-empty array")
+        raise HTTPException(
+            status_code=400,
+            detail="tiles must be a non-empty array.",
+        )
 
-    max_tiles = int(env_value(request, "MAX_TILES", str(MAX_TILES_DEFAULT)))
+    max_tiles = env_int(
+        request,
+        "MAX_TILES",
+        MAX_TILES_DEFAULT,
+    )
+
     tiles = tiles[:max_tiles]
 
-    total = 0
-    normalized_tiles: list[dict[str, str]] = []
+    normalized_tiles: list[dict[str, Any]] = []
+    total_b64 = 0
 
-    for idx, tile in enumerate(tiles):
-        if not isinstance(tile, dict):
-            continue
-        image = tile.get("image") or tile.get("data") or tile.get("base64")
-        if not image:
-            continue
-        mime = str(tile.get("mime_type") or tile.get("mimeType") or "image/jpeg")
-        data = normalize_b64(str(image))
-        total += len(data)
-        if len(data) > MAX_IMAGE_B64:
-            raise HTTPException(status_code=413, detail=f"Tile {idx + 1} is too large")
-        normalized_tiles.append(
-            {
-                "id": str(tile.get("id") or idx + 1),
-                "image": data,
-                "mime_type": mime,
-            }
+    try:
+        for index, tile in enumerate(tiles):
+            if not isinstance(tile, dict):
+                continue
+
+            image = (
+                tile.get("image")
+                or tile.get("data")
+                or tile.get("base64")
+            )
+
+            normalized = validate_image(
+                request,
+                image,
+                tile.get("mime_type")
+                or tile.get("mimeType")
+                or "image/jpeg",
+            )
+
+            total_b64 += len(
+                normalized["data"]
+            )
+
+            normalized_tiles.append(
+                {
+                    "id": str(
+                        tile.get("id")
+                        or index + 1
+                    ),
+                    **normalized,
+                }
+            )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    max_total = env_int(
+        request,
+        "MAX_TOTAL_IMAGE_B64",
+        MAX_TOTAL_IMAGE_B64_DEFAULT,
+    )
+
+    if total_b64 > max_total:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Total image payload is too large. "
+                "Reduce tile count or tile resolution."
+            ),
         )
 
     if not normalized_tiles:
-        raise HTTPException(status_code=400, detail="No valid image tiles supplied")
-
-    if total > MAX_TOTAL_IMAGE_B64:
         raise HTTPException(
-            status_code=413,
-            detail="Total tile image data is too large; send fewer/smaller tiles",
+            status_code=400,
+            detail="No valid image tiles were supplied.",
         )
 
-    model = env_value(request, "GEMINI_MODEL", DEFAULT_MODEL)
-    fallback = env_value(request, "GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK)
+    model = env_value(
+        request,
+        "GEMINI_MODEL",
+        DEFAULT_MODEL,
+    )
+
+    fallback = env_value(
+        request,
+        "GEMINI_FALLBACK_MODEL",
+        DEFAULT_FALLBACK_MODEL,
+    )
+
+    # --------------------------------------------------------
+    # P&ID NUMBER
+    # --------------------------------------------------------
 
     pid_no = ""
     pid_evidence = ""
     pid_confidence = ""
 
     if isinstance(overview, dict):
-        overview_image = overview.get("image") or overview.get("data") or overview.get("base64")
+        overview_image = (
+            overview.get("image")
+            or overview.get("data")
+            or overview.get("base64")
+        )
+
         if overview_image:
             try:
-                result = await call_gemini(
+                overview_img = validate_image(
+                    request,
+                    overview_image,
+                    overview.get("mime_type")
+                    or overview.get("mimeType")
+                    or "image/jpeg",
+                )
+
+                overview_result = await call_gemini(
                     request,
                     model=model,
                     prompt=OVERVIEW_PROMPT,
                     schema=OVERVIEW_SCHEMA,
-                    image_b64=normalize_b64(str(overview_image)),
-                    mime_type=str(overview.get("mime_type") or "image/jpeg"),
+                    images=[overview_img],
                 )
-                pid_no = clean_tag(result.get("pid_no"))
-                pid_evidence = str(result.get("evidence") or "")
-                pid_confidence = str(result.get("confidence") or "")
+
+                pid_no = clean_tag(
+                    overview_result.get("pid_no")
+                )
+                pid_evidence = str(
+                    overview_result.get("evidence")
+                    or ""
+                ).strip()
+                pid_confidence = str(
+                    overview_result.get("confidence")
+                    or ""
+                ).strip().lower()
+
             except Exception:
                 try:
-                    result = await call_gemini(
+                    overview_result = await call_gemini(
                         request,
                         model=fallback,
                         prompt=OVERVIEW_PROMPT,
                         schema=OVERVIEW_SCHEMA,
-                        image_b64=normalize_b64(str(overview_image)),
-                        mime_type=str(overview.get("mime_type") or "image/jpeg"),
+                        images=[overview_img],
                     )
-                    pid_no = clean_tag(result.get("pid_no"))
-                    pid_evidence = str(result.get("evidence") or "")
-                    pid_confidence = str(result.get("confidence") or "")
+
+                    pid_no = clean_tag(
+                        overview_result.get("pid_no")
+                    )
+                    pid_evidence = str(
+                        overview_result.get("evidence")
+                        or ""
+                    ).strip()
+                    pid_confidence = str(
+                        overview_result.get("confidence")
+                        or ""
+                    ).strip().lower()
+
                 except Exception:
                     pass
 
-    async def process_tile(tile: dict[str, str]) -> list[dict[str, Any]]:
+    # --------------------------------------------------------
+    # TILE EXTRACTION
+    # --------------------------------------------------------
+
+    async def process_tile(
+        tile: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+
         try:
             result = await call_gemini(
                 request,
                 model=model,
-                prompt=EXTRACT_PROMPT,
+                prompt=TAG_PROMPT,
                 schema=TAG_SCHEMA,
-                image_b64=tile["image"],
-                mime_type=tile["mime_type"],
+                images=[
+                    {
+                        "data": tile["data"],
+                        "mime_type": tile["mime_type"],
+                    }
+                ],
             )
         except Exception:
             result = await call_gemini(
                 request,
                 model=fallback,
-                prompt=EXTRACT_PROMPT,
+                prompt=TAG_PROMPT,
                 schema=TAG_SCHEMA,
-                image_b64=tile["image"],
-                mime_type=tile["mime_type"],
+                images=[
+                    {
+                        "data": tile["data"],
+                        "mime_type": tile["mime_type"],
+                    }
+                ],
             )
 
         tags = result.get("tags", [])
+
         if not isinstance(tags, list):
             return []
 
-        cleaned: list[dict[str, Any]] = []
+        output = []
+
         for item in tags:
             if not isinstance(item, dict):
                 continue
-            tag = clean_tag(item.get("tag_no"))
+
+            tag = clean_tag(
+                item.get("tag_no")
+            )
+
             if not tag:
                 continue
-            size = clean_size(item.get("size_nps_in"))
-            if not size:
-                size = parse_size_from_tag(tag)
 
-            cleaned.append(
+            size = clean_size(
+                item.get("size_nps_in")
+            )
+
+            if not size:
+                size = size_from_tag(tag)
+
+            output.append(
                 {
                     "tag_no": tag,
                     "size_nps_in": size,
-                    "evidence": item.get("evidence", ""),
-                    "confidence": item.get("confidence", ""),
+                    "evidence": str(
+                        item.get("evidence") or ""
+                    ).strip(),
+                    "confidence": str(
+                        item.get("confidence") or ""
+                    ).strip().lower(),
                     "tile_id": tile["id"],
                 }
             )
-        return cleaned
 
-    # Small concurrency avoids hammering the API while keeping the Worker responsive.
-    results = await asyncio.gather(*(process_tile(tile) for tile in normalized_tiles))
+        return output
 
-    raw_tags: list[dict[str, Any]] = []
-    for tile_items in results:
-        raw_tags.extend(tile_items)
+    results = await asyncio.gather(
+        *(
+            process_tile(tile)
+            for tile in normalized_tiles
+        )
+    )
 
-    tags = dedupe_tags(raw_tags)
+    raw_candidates: list[dict[str, Any]] = []
 
-    for item in tags:
-        item["pid_no"] = pid_no
+    for items in results:
+        raw_candidates.extend(items)
+
+    final_tags = dedupe_tags(
+        raw_candidates,
+        pid_no,
+    )
 
     return {
         "status": "ok",
+        "version": APP_VERSION,
         "model": model,
         "fallback_model": fallback,
         "pid_no": pid_no,
         "pid_evidence": pid_evidence,
         "pid_confidence": pid_confidence,
-        "count": len(tags),
-        "tags": tags,
+        "count": len(final_tags),
+        "tags": final_tags,
         "meta": {
+            "tiles_received": len(tiles),
             "tiles_processed": len(normalized_tiles),
-            "raw_candidates": len(raw_tags),
+            "raw_candidates": len(raw_candidates),
             "line_description": "blank",
         },
     }
