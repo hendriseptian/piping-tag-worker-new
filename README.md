@@ -1,70 +1,35 @@
-# Piping Tag Extractor Worker
+# Piping Tag Extractor Frontend V1
 
-Dedicated Cloudflare Python Worker for extracting P&ID piping tags with Gemini vision.
+Static GitHub Pages frontend for:
 
-## Structure
+https://piping-tag-worker-new.side-gs78.workers.dev
 
-- `src/main.py` - FastAPI Worker
-- `pyproject.toml` - Python dependencies and Pywrangler
-- `wrangler.jsonc` - Cloudflare Worker configuration
+## Files
 
-## Cloudflare setup
+- `index.html` — UI
+- `style.css` — dark responsive UI
+- `script.js` — PDF.js rendering, overlapping tiles, Worker API call, editable result table, Excel export
 
-Create a new Worker connected to this repository.
+## Processing
 
-Root directory: `/`
+1. Select a PDF.
+2. The first page is rendered in the browser with PDF.js.
+3. The page is divided into 4 × 2 = 8 overlapping tiles.
+4. Tiles are JPEG-compressed to stay within Worker payload limits.
+5. A reduced full-page overview is sent for P&ID number detection.
+6. Tiles are sent to `/api/extract`.
+7. Results are editable.
+8. Excel contains exactly:
+   - Tag No.
+   - P&ID No.
+   - From
+   - To
+   - NPS (in)
 
-Build command:
-```text
-echo "No build step required"
-```
+`From` and `To` are intentionally exported blank.
 
-Deploy command:
-```text
-uv run pywrangler deploy
-```
+## GitHub Pages
 
-Add Worker secret:
-```text
-GEMINI_API_KEY
-```
+Upload the three frontend files to a GitHub Pages repository and publish from the selected branch/folder.
 
-Do not put the Gemini key in GitHub or frontend code.
-
-## API
-
-### GET /health
-
-Returns Worker and model status.
-
-### POST /api/extract
-
-JSON body:
-```json
-{
-  "overview": {
-    "image": "<base64 or data URL>",
-    "mime_type": "image/jpeg"
-  },
-  "tiles": [
-    {
-      "id": "tile-1",
-      "image": "<base64 or data URL>",
-      "mime_type": "image/jpeg"
-    }
-  ]
-}
-```
-
-The response contains:
-- `Tag No.`
-- `P&ID No.`
-- `From` (blank)
-- `To` (blank)
-- `NPS (in)`
-- evidence/confidence for review
-
-## Model
-
-Primary: `gemini-3.8-flash`
-Fallback: `gemini-3.7-flash`
+No backend secret is stored in the frontend.

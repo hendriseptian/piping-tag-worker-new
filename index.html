@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Piping Tag Extractor</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">P&ID INTELLIGENCE</div>
+        <h1>Piping Tag Extractor</h1>
+        <p>Extract piping line tags from scanned or vector P&ID drawings with AI vision.</p>
+      </div>
+      <div class="status-pill" id="connectionStatus">
+        <span class="status-dot"></span>
+        <span>Ready</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="card upload-card">
+        <div class="section-heading">
+          <div>
+            <span class="step">01</span>
+            <h2>Upload P&ID</h2>
+          </div>
+          <span class="hint">PDF • 1 sheet per extraction</span>
+        </div>
+
+        <label class="dropzone" id="dropzone" for="pdfInput">
+          <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden>
+          <div class="upload-icon">↑</div>
+          <strong id="dropTitle">Drop PDF here or click to browse</strong>
+          <span id="dropHint">The first page will be processed.</span>
+        </label>
+
+        <div class="file-row hidden" id="fileRow">
+          <div>
+            <strong id="fileName">—</strong>
+            <span id="fileMeta">—</span>
+          </div>
+          <button class="btn btn-ghost" id="removeFileBtn" type="button">Remove</button>
+        </div>
+
+        <div class="controls">
+          <label>
+            <span>Rendering scale</span>
+            <select id="scaleSelect">
+              <option value="2.5">2.5× — Fast</option>
+              <option value="3" selected>3× — Recommended</option>
+              <option value="3.5">3.5× — High detail</option>
+              <option value="4">4× — Maximum detail</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Tile layout</span>
+            <select id="tileSelect">
+              <option value="4x2" selected>4 × 2 — 8 overlapping tiles</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="analyzeBtn" type="button" disabled>
+            Analyze Piping Tags
+          </button>
+        </div>
+      </section>
+
+      <section class="card progress-card hidden" id="progressCard">
+        <div class="section-heading">
+          <div>
+            <span class="step">02</span>
+            <h2>AI Extraction</h2>
+          </div>
+          <span id="progressPercent">0%</span>
+        </div>
+        <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+        <p class="progress-message" id="progressMessage">Preparing PDF…</p>
+        <div class="progress-grid">
+          <div><span>Tiles</span><strong id="progressTiles">0 / 8</strong></div>
+          <div><span>AI candidates</span><strong id="progressCandidates">—</strong></div>
+          <div><span>Final tags</span><strong id="progressFinal">—</strong></div>
+        </div>
+      </section>
+
+      <section class="card preview-card hidden" id="previewCard">
+        <div class="section-heading">
+          <div>
+            <span class="step">03</span>
+            <h2>Results</h2>
+          </div>
+          <div class="result-actions">
+            <button class="btn btn-ghost" id="addRowBtn" type="button">+ Add row</button>
+            <button class="btn btn-primary" id="exportBtn" type="button">Export Excel</button>
+          </div>
+        </div>
+
+        <div class="drawing-info">
+          <div>
+            <span>P&ID No.</span>
+            <strong id="pidNo">—</strong>
+          </div>
+          <div>
+            <span>AI candidates</span>
+            <strong id="candidateCount">0</strong>
+          </div>
+          <div>
+            <span>Final unique tags</span>
+            <strong id="tagCount">0</strong>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table id="resultsTable">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Tag No.</th>
+                <th>P&ID No.</th>
+                <th>From</th>
+                <th>To</th>
+                <th>NPS (in)</th>
+                <th>Confidence</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="resultsBody"></tbody>
+          </table>
+        </div>
+
+        <div class="empty-state hidden" id="emptyState">
+          No piping tags were returned. Try a higher rendering scale or inspect the PDF.
+        </div>
+      </section>
+
+      <section class="card log-card hidden" id="logCard">
+        <details>
+          <summary>Technical log</summary>
+          <pre id="logOutput"></pre>
+        </details>
+      </section>
+    </main>
+
+    <footer>
+      Piping Tag Extractor · Gemini vision backend · From / To intentionally blank
+    </footer>
+  </div>
+
+  <script type="module" src="script.js"></script>
+</body>
+</html>
