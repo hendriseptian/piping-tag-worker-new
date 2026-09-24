@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from workers import asgi
 
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.7-flash"
 
@@ -22,6 +22,13 @@ INTERACTIONS_URL = (
 )
 
 
+app = FastAPI(
+    title="Piping Tag Extractor Worker",
+    version=APP_VERSION,
+)
+
+# GitHub Pages frontend -> Cloudflare Worker API.
+# The origin is restricted to the actual GitHub Pages site.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
