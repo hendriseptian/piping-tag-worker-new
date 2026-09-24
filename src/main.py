@@ -7,13 +7,13 @@ from fastapi import FastAPI, HTTPException, Request
 from workers import asgi
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.7-flash"
 
 MAX_TILES_DEFAULT = 16
 MAX_IMAGE_B64_DEFAULT = 5_500_000
-MAX_TOTAL_IMAGE_B64_DEFAULT = 18_000_000
+MAX_TOTAL_IMAGE_B64_DEFAULT = 45_000_000
 
 INTERACTIONS_URL = (
     "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -956,62 +956,37 @@ async def extract(request: Request):
                     pass
 
     # --------------------------------------------------------
-    # TILE EXTRACTION
+    # TILE EXTRACTION — BATCHED HIGH-RECALL ENGINE
     # --------------------------------------------------------
+    # V1.2.1 keeps the 4x4 visual grid (16 tiles) but sends them in
+    # batches of 4 images per Gemini interaction. This is critical for
+    # free-tier rate limits: 16 separate vision requests can exhaust the
+    # daily request allowance very quickly. Four batched requests give
+    # Gemini the same visual coverage with far fewer API calls.
+    BATCH_SIZE = 4
 
-    async def process_tile(
-        tile: dict[str, Any]
+    def make_batches(items: list[dict[str, Any]], size: int):
+        for i in range(0, len(items), size):
+            yield items[i:i + size]
+
+    def normalize_result_tags(
+        result: dict[str, Any],
+        tile_ids: list[str],
     ) -> list[dict[str, Any]]:
-
-        try:
-            result = await call_gemini(
-                request,
-                model=model,
-                prompt=TAG_PROMPT,
-                schema=TAG_SCHEMA,
-                images=[
-                    {
-                        "data": tile["data"],
-                        "mime_type": tile["mime_type"],
-                    }
-                ],
-            )
-        except Exception:
-            result = await call_gemini(
-                request,
-                model=fallback,
-                prompt=TAG_PROMPT,
-                schema=TAG_SCHEMA,
-                images=[
-                    {
-                        "data": tile["data"],
-                        "mime_type": tile["mime_type"],
-                    }
-                ],
-            )
-
         tags = result.get("tags", [])
-
         if not isinstance(tags, list):
             return []
 
         output = []
-
         for item in tags:
             if not isinstance(item, dict):
                 continue
 
-            tag = clean_tag(
-                item.get("tag_no")
-            )
-
+            tag = clean_tag(item.get("tag_no"))
             if not tag:
                 continue
 
-            size = clean_size(
-                item.get("size_nps_in")
-            )
-
+            size = clean_size(item.get("size_nps_in"))
             if not size:
                 size = size_from_tag(tag)
 
@@ -1019,52 +994,103 @@ async def extract(request: Request):
                 {
                     "tag_no": tag,
                     "size_nps_in": size,
-                    "evidence": str(
-                        item.get("evidence") or ""
-                    ).strip(),
-                    "confidence": str(
-                        item.get("confidence") or ""
-                    ).strip().lower(),
-                    "tile_id": tile["id"],
+                    "evidence": str(item.get("evidence") or "").strip(),
+                    "confidence": str(item.get("confidence") or "").strip().lower(),
+                    # A batch response can contain tags from any of its
+                    # four images. Preserve the batch provenance rather
+                    # than pretending we know an exact tile.
+                    "tile_id": ",".join(tile_ids),
                 }
             )
-
         return output
 
-    # Process tiles sequentially. This is intentionally conservative for
-    # Cloudflare Workers: it avoids a burst of 8 simultaneous Gemini
-    # requests and lets one failed tile fall back without killing the
-    # entire extraction.
-    raw_candidates: list[dict[str, Any]] = []
-    tile_errors: list[dict[str, str]] = []
+    async def process_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        images = [
+            {
+                "data": tile["data"],
+                "mime_type": tile["mime_type"],
+            }
+            for tile in batch
+        ]
+        tile_ids = [str(tile["id"]) for tile in batch]
 
-    for tile in normalized_tiles:
+        batch_prompt = TAG_PROMPT + r"""
+
+MULTI-IMAGE BATCH RULE:
+The supplied images are adjacent, overlapping tiles from ONE P&ID page.
+Treat the entire batch as one visual search area.
+Inspect EVERY image independently, then cross-check overlaps before returning.
+Do not assume that a tag seen in one image is the only occurrence in the batch.
+Do not omit a tag simply because another image contains the same pipe run.
+Return each distinct piping line tag only once in this batch.
+"""
+
         try:
-            items = await process_tile(tile)
+            result = await call_gemini(
+                request,
+                model=model,
+                prompt=batch_prompt,
+                schema=TAG_SCHEMA,
+                images=images,
+            )
+            return normalize_result_tags(result, tile_ids)
+        except Exception as primary_exc:
+            primary_text = str(primary_exc)
+
+            # A 429 means the primary model is rate-limited. Retrying the
+            # same batch on the fallback can consume another daily request
+            # without improving the situation, so do not cascade on 429.
+            if "Gemini HTTP 429" in primary_text or "429" in primary_text:
+                raise RuntimeError(primary_text)
+
+            # For model/location/availability failures, try the configured
+            # fallback once for the whole batch, not once per tile.
+            try:
+                result = await call_gemini(
+                    request,
+                    model=fallback,
+                    prompt=batch_prompt,
+                    schema=TAG_SCHEMA,
+                    images=images,
+                )
+                return normalize_result_tags(result, tile_ids)
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Primary: {primary_text[:1000]} | "
+                    f"Fallback: {str(fallback_exc)[:1000]}"
+                )
+
+    raw_candidates: list[dict[str, Any]] = []
+    batch_errors: list[dict[str, str]] = []
+    batches = list(make_batches(normalized_tiles, BATCH_SIZE))
+
+    for batch_index, batch in enumerate(batches, start=1):
+        try:
+            items = await process_batch(batch)
             raw_candidates.extend(items)
         except Exception as exc:
-            tile_errors.append(
+            batch_errors.append(
                 {
-                    "tile_id": str(tile.get("id", "")),
-                    "error": str(exc)[:1200],
+                    "batch": str(batch_index),
+                    "tile_ids": ",".join(str(t["id"]) for t in batch),
+                    "error": str(exc)[:2000],
                 }
             )
 
-    # If every tile failed, return a JSON error response rather than
-    # allowing an unhandled exception to become a Cloudflare 500 page.
-    if not raw_candidates and tile_errors:
+    if not raw_candidates and batch_errors:
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Gemini could not process any image tile.",
-                "tile_errors": tile_errors,
+                "message": "Gemini could not process any image batch.",
+                "batch_errors": batch_errors,
+                "hint": (
+                    "The scan engine uses 4 Gemini vision requests for 16 tiles. "
+                    "If a batch returns 429, wait for the Gemini quota reset."
+                ),
             },
         )
 
-    final_tags = dedupe_tags(
-        raw_candidates,
-        pid_no,
-    )
+    final_tags = dedupe_tags(raw_candidates, pid_no)
 
     return {
         "status": "ok",
@@ -1079,8 +1105,10 @@ async def extract(request: Request):
         "meta": {
             "tiles_received": len(tiles),
             "tiles_processed": len(normalized_tiles),
+            "batches_sent": len(batches),
+            "batch_size": BATCH_SIZE,
             "raw_candidates": len(raw_candidates),
-            "tile_errors": tile_errors,
+            "batch_errors": batch_errors,
             "line_description": "blank",
         },
     }
