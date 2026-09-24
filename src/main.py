@@ -604,7 +604,7 @@ async def health(request: Request):
     }
 
 
-@app.post("/api/test-gemini")
+@app.post("/api/test-gemini", methods=["GET", "POST"])
 async def test_gemini(request: Request):
     model = env_value(
         request,
