@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from workers import asgi
 
 
@@ -21,9 +22,14 @@ INTERACTIONS_URL = (
 )
 
 
-app = FastAPI(
-    title="Piping Tag Extractor Worker",
-    version=APP_VERSION,
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://hendriseptian.github.io",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
 
 
