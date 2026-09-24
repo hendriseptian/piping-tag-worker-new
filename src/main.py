@@ -7,11 +7,11 @@ from fastapi import FastAPI, HTTPException, Request
 from workers import asgi
 
 
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.2.0"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.7-flash"
 
-MAX_TILES_DEFAULT = 8
+MAX_TILES_DEFAULT = 16
 MAX_IMAGE_B64_DEFAULT = 5_500_000
 MAX_TOTAL_IMAGE_B64_DEFAULT = 18_000_000
 
@@ -205,19 +205,42 @@ IMPORTANT:
 """
 
 TAG_PROMPT = r"""
-You are a specialist P&ID line-tag extraction system.
+You are a specialist P&ID piping line-tag extraction system.
 
 TASK:
-Extract ONLY piping LINE TAGS visible in the supplied P&ID image tile.
+Extract EVERY visible piping LINE TAG in the supplied P&ID image tile.
+The goal is HIGH RECALL: do not stop after finding a few obvious tags.
 
-A piping line tag is the designation printed for a process/utility piping line.
+SYSTEMATIC VISUAL SWEEP:
+1. Scan the entire tile from LEFT to RIGHT, then TOP to BOTTOM.
+2. Inspect every process/utility pipe run and every line-number callout.
+3. Inspect tags near valves, equipment, instruments, branches, and line breaks.
+4. Inspect small text, crowded areas, and tags close to symbols.
+5. Check BOTH horizontal and vertical/rotated text. A valid tag may be
+   printed at 90 degrees.
+6. Check the tile edges carefully. The same tag may appear in an overlap,
+   but do not ignore a fully readable tag merely because it is near an edge.
+7. Before returning, perform a SECOND PASS specifically looking for tags
+   that were small, vertical, isolated, or visually crowded.
+8. Do not stop when you have found several tags. Continue until the whole
+   tile has been inspected.
+
+WHAT COUNTS AS A PIPING LINE TAG:
+A piping line tag is the designation printed for a process/utility piping
+line. Typical examples from this drawing include patterns such as:
+- 1BD3-6"-CB2B
+- 1P5-20"-FG2D
+- 1BD24-10"-BM4B
+- 1OWS14-3/4"-CB2B
+These examples are only pattern guidance. Extract any valid line tag that is
+actually visible; do not limit extraction to these examples.
 
 DO NOT extract:
 - equipment tags
 - valve tags
 - instrument tags
 - nozzle numbers
-- dimensions
+- dimensions that are not part of a line tag
 - elevations
 - grid references
 - revision numbers
@@ -225,39 +248,43 @@ DO NOT extract:
 - page numbers
 - drawing numbers
 - pressure/temperature values
-- material specifications
+- material specifications by themselves
 - random numeric labels
 
 ACCURACY RULES:
-
-1. Transcribe the tag EXACTLY as visible.
-2. Never invent, repair, autocorrect, or normalize characters.
+1. Transcribe the complete tag EXACTLY as visible.
+2. Never invent, repair, autocorrect, or normalize uncertain characters.
 3. Do not combine text from two different nearby labels.
 4. Do not use a nearby valve/nozzle size as the line size.
-5. Ignore a tag if it is cut off or genuinely ambiguous.
-6. Prefer omission over guessing.
-7. The evidence must be a short transcription of the visible line tag.
+5. A tag is valid only when the complete line-tag text is readable enough
+   to identify it as one coherent piping tag.
+6. Prefer a correct omission over a guessed character.
+7. Evidence must be a short exact transcription of the visible tag.
 8. Confidence must be high, medium, or low.
 9. Return only actual piping line tags.
+10. Different tags that look similar but have different sequence numbers are
+    separate tags and must each be returned.
 
 NPS RULES:
-
 - Extract NPS from the size explicitly belonging to the line tag.
 - Example:
   1HC106-1"-FC2L
   => tag_no = 1HC106-1"-FC2L
   => size_nps_in = 1
-
 - Example:
   1HC1-2"-FG2D
   => tag_no = 1HC1-2"-FG2D
   => size_nps_in = 2
-
-- If the NPS is not explicitly readable in the tag, return an empty size_nps_in.
+- Fractional sizes must be preserved, for example 1 1/2" or 3/4" when
+  explicitly visible. Return the numeric NPS value in size_nps_in.
+- If the NPS is not explicitly readable in the tag, return an empty
+  size_nps_in.
 - Never guess the NPS from nearby graphics.
 
 TILE BOUNDARY RULE:
-If a tag is cut by the edge of the supplied tile, ignore it. It will be recovered from an overlapping neighboring tile.
+- If a tag is genuinely cut off by the edge and the complete text cannot be
+  read, ignore it. It should be recovered from an overlapping tile.
+- If the complete tag is readable even near an edge, return it.
 
 Return JSON matching the supplied schema.
 """
@@ -527,12 +554,42 @@ def clean_tag(value: Any) -> str:
         return ""
 
     value = str(value).strip()
+    value = (
+        value
+        .replace("″", '"')
+        .replace("”", '"')
+        .replace("“", '"')
+        .replace("–", "-")
+        .replace("—", "-")
+    )
 
-    # Preserve the actual characters but remove accidental
-    # whitespace introduced by OCR/vision transcription.
-    value = re.sub(r"\s+", "", value)
-
+    # Preserve the internal space in fractional NPS values such as
+    # 1 1/2". Remove whitespace around tag separators only.
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r"\s*-\s*", "-", value)
     return value
+
+
+def fraction_to_decimal(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+
+    try:
+        if re.fullmatch(r"\d+\s+\d+/\d+", value):
+            whole, frac = value.split()
+            numerator, denominator = frac.split("/")
+            result = int(whole) + int(numerator) / int(denominator)
+            return f"{result:g}"
+        if re.fullmatch(r"\d+/\d+", value):
+            numerator, denominator = value.split("/")
+            result = int(numerator) / int(denominator)
+            return f"{result:g}"
+        if re.fullmatch(r"\d+(?:\.\d+)?", value):
+            return value
+    except (ValueError, ZeroDivisionError):
+        return ""
+    return ""
 
 
 def clean_size(value: Any) -> str:
@@ -540,50 +597,35 @@ def clean_size(value: Any) -> str:
         return ""
 
     value = str(value).strip()
-
     value = (
         value
         .replace("″", '"')
         .replace("”", '"')
         .replace("“", '"')
     )
-
-    value = re.sub(r"\s+", "", value)
-
-    match = re.fullmatch(
-        r"(\d+(?:\.\d+)?)\"?",
-        value,
-    )
-
-    if match:
-        return match.group(1)
-
-    return ""
+    value = re.sub(r'\s*"\s*$', "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return fraction_to_decimal(value)
 
 
 def size_from_tag(tag: str) -> str:
-    # Primary expected pattern:
-    # 1HC106-1"-FC2L
+    # Primary: size between hyphens, e.g. 1HC106-1"-FC2L.
     match = re.search(
-        r'-(\d+(?:\.\d+)?)["″”](?:-|$)',
+        r'-(\d+(?:\s+\d+/\d+|/\d+|(?:\.\d+)?))["″”](?:-|$)',
         tag,
     )
-
     if match:
-        return match.group(1)
+        return fraction_to_decimal(match.group(1))
 
-    # Secondary:
-    # prefix-1"
+    # Secondary: tolerate a tag that ends immediately after the size.
     match = re.search(
-        r'(\d+(?:\.\d+)?)["″”](?:-|$)',
+        r'(\d+(?:\s+\d+/\d+|/\d+|(?:\.\d+)?))["″”](?:-|$)',
         tag,
     )
-
     if match:
-        return match.group(1)
+        return fraction_to_decimal(match.group(1))
 
     return ""
-
 
 def dedupe_tags(
     items: list[dict[str, Any]],
@@ -599,7 +641,7 @@ def dedupe_tags(
         if not tag:
             continue
 
-        key = tag.upper()
+        key = re.sub(r"\s+", "", tag.upper())
 
         if key in seen:
             continue
@@ -757,11 +799,14 @@ async def extract(request: Request):
             detail="tiles must be a non-empty array.",
         )
 
-    max_tiles = env_int(
+    configured_max_tiles = env_int(
         request,
         "MAX_TILES",
         MAX_TILES_DEFAULT,
     )
+    # V1.2 requires the 4x4 scan engine. Keep compatibility with an older
+    # Cloudflare variable that may still be set to 8.
+    max_tiles = max(MAX_TILES_DEFAULT, configured_max_tiles)
 
     tiles = tiles[:max_tiles]
 
