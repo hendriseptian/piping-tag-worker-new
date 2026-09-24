@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import json
 import re
@@ -8,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Request
 from workers import asgi
 
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODEL = "gemini-3.7-flash"
 
@@ -412,11 +411,13 @@ async def call_gemini(
         "model": model,
         "store": False,
         "input": content,
-        "response_format": {
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": schema,
-        },
+        "response_format": [
+            {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": schema,
+            }
+        ],
     }
 
     response = await cf_fetch(
@@ -985,17 +986,35 @@ async def extract(request: Request):
 
         return output
 
-    results = await asyncio.gather(
-        *(
-            process_tile(tile)
-            for tile in normalized_tiles
-        )
-    )
-
+    # Process tiles sequentially. This is intentionally conservative for
+    # Cloudflare Workers: it avoids a burst of 8 simultaneous Gemini
+    # requests and lets one failed tile fall back without killing the
+    # entire extraction.
     raw_candidates: list[dict[str, Any]] = []
+    tile_errors: list[dict[str, str]] = []
 
-    for items in results:
-        raw_candidates.extend(items)
+    for tile in normalized_tiles:
+        try:
+            items = await process_tile(tile)
+            raw_candidates.extend(items)
+        except Exception as exc:
+            tile_errors.append(
+                {
+                    "tile_id": str(tile.get("id", "")),
+                    "error": str(exc)[:1200],
+                }
+            )
+
+    # If every tile failed, return a JSON error response rather than
+    # allowing an unhandled exception to become a Cloudflare 500 page.
+    if not raw_candidates and tile_errors:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Gemini could not process any image tile.",
+                "tile_errors": tile_errors,
+            },
+        )
 
     final_tags = dedupe_tags(
         raw_candidates,
@@ -1016,6 +1035,7 @@ async def extract(request: Request):
             "tiles_received": len(tiles),
             "tiles_processed": len(normalized_tiles),
             "raw_candidates": len(raw_candidates),
+            "tile_errors": tile_errors,
             "line_description": "blank",
         },
     }
